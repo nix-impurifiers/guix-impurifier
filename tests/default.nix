@@ -4,13 +4,53 @@
   impurifier,
   coreSrc,
   tools,
+  bundled ? false,
 }:
 let
   app = pkgs.writeShellScriptBin "guix-app" "echo guix-nix-one" // {
     pname = "guix-app";
     version = "1";
   };
-  emitted = impurifier.makeOfflinePackage { pkg = app; };
+  staticNix = import (coreSrc + "/tests/static-nix.nix") { inherit pkgs; };
+  bundleArgs = pkgs.lib.optionalAttrs bundled {
+    bundledNixStore = "${staticNix}/bin/nix-store";
+    bundledNixNotices = [ "${pkgs.nix.src}/COPYING" ];
+  };
+  builder = impurifier // {
+    makeNetPackage = args: impurifier.makeNetPackage (args // bundleArgs);
+    makeOfflinePackage = args: impurifier.makeOfflinePackage (args // bundleArgs);
+  };
+  native =
+    version:
+    impurifier.makeNativePackage {
+      name = "native-proof";
+      inherit version;
+      license = "expat";
+      payload =
+        pkgs.runCommand "native-guix-${version}" { nativeBuildInputs = [ pkgs.pkgsStatic.stdenv.cc ]; }
+          ''
+            mkdir -p $out/bin
+            echo '#include <stdio.h>' > proof.c
+            echo 'int main(void) { puts("native-guix-${version}"); return 0; }' >> proof.c
+            $CC -static proof.c -o $out/bin/native-proof
+          '';
+    };
+  nativeManifest =
+    version:
+    pkgs.writeText "native-guix-manifest-${version}.scm" ''
+      (use-modules (guix profiles) (guix store) (guix packages) (gnu packages guile))
+      (with-store store (%guile-for-build (package-derivation store guile-3.0 #:graft? #f)))
+      (packages->manifest (list (load "/home/consumer/native${version}/package.scm")))
+    '';
+  emptyManifest = pkgs.writeText "native-guix-empty.scm" ''
+    (use-modules (guix profiles) (guix store) (guix packages) (gnu packages guile))
+    (with-store store (%guile-for-build (package-derivation store guile-3.0 #:graft? #f)))
+    (use-modules (guix gexp))
+    (manifest (list (manifest-entry
+      (name "empty-native-marker") (version "1")
+      (item (local-file "/home/consumer/empty-tree" #:recursive? #t)))))
+  '';
+  emitted = builder.makeOfflinePackage { pkg = app; };
   packageManifest = pkgs.writeText "guix-application-manifest.scm" ''
     (use-modules (guix profiles) (guix store) (guix packages) (gnu packages guile))
     (with-store store (%guile-for-build (package-derivation store guile-3.0 #:graft? #f)))
@@ -20,15 +60,15 @@ let
     pname = "guix-app";
     version = "2";
   };
-  emitted2 = impurifier.makeOfflinePackage { pkg = app2; };
-  net = impurifier.makeNetPackage { pkg = app; };
+  emitted2 = builder.makeOfflinePackage { pkg = app2; };
+  net = builder.makeNetPackage { pkg = app; };
   packageManifest2 = pkgs.writeText "guix-application-manifest-2.scm" ''
     (use-modules (guix profiles) (guix store) (guix packages) (gnu packages guile))
     (with-store store (%guile-for-build (package-derivation store guile-3.0 #:graft? #f)))
     (packages->manifest (list (load "/home/consumer/emitted2/package.scm")))
   '';
   fixture = import (coreSrc + "/tests/hardware-fixture.nix") { inherit pkgs; };
-  hardware = impurifier.makeOfflinePackage {
+  hardware = builder.makeOfflinePackage {
     pkg = fixture.tool;
     inherit (fixture) hardware;
   };
@@ -49,7 +89,8 @@ let
 in
 {
   native-vm = pkgs.testers.runNixOSTest {
-    name = "guix-native-contract";
+    name = "guix-native-contract${pkgs.lib.optionalString bundled "-bundled"}";
+    globalTimeout = 1200;
     requiredFeatures = {
       kvm = false;
       devnet = false;
@@ -81,10 +122,27 @@ in
       machine.succeed("mkdir -p /root/drivers /usr/lib; cp ${fixture.driver "1"}/usr/lib/libimpurifier-driver.so.1 /root/drivers/1.so; cp ${fixture.driver "2"}/usr/lib/libimpurifier-driver.so.1 /root/drivers/2.so")
       guix = "/var/guix/profiles/per-user/root/current-guix/bin/guix"
       def succeed(command):
-          return machine.succeed("su - consumer -c " + shlex.quote(command))
+          return machine.succeed("su - consumer -c " + shlex.quote(("PATH=/home/consumer/no-nix:$PATH " if ${
+            if bundled then "True" else "False"
+          } else "") + command))
       succeed(guix + " package --bootstrap --no-substitutes -p /home/consumer/profile -m /home/consumer/manifest.scm")
       assert succeed("/home/consumer/profile/bin/native-marker").strip() == "native-guix"
       succeed(guix + " package -p /home/consumer/profile --list-installed")
+      machine.succeed("cp -r ${native "1"} /home/consumer/native1; cp -r ${native "2"} /home/consumer/native2; cp ${nativeManifest "1"} /home/consumer/native1.scm; cp ${nativeManifest "2"} /home/consumer/native2.scm; cp ${emptyManifest} /home/consumer/empty.scm; mkdir -p /home/consumer/empty-tree/share; echo empty > /home/consumer/empty-tree/share/empty")
+      succeed(guix + " package --bootstrap --no-substitutes -p /home/consumer/native-profile -m /home/consumer/native1.scm")
+      assert succeed("/home/consumer/native-profile/bin/native-proof").strip() == "native-guix-1"
+      machine.succeed("mkdir -p /srv/native/bin; cp /home/consumer/native-profile/bin/native-proof /srv/native/bin/native-proof")
+      assert machine.succeed("chroot /srv/native /bin/native-proof").strip() == "native-guix-1"
+      machine.succeed("test ! -e /srv/native/nix; test ! -e /home/consumer/native-profile/launch.py")
+      succeed(guix + " package --bootstrap --no-substitutes -p /home/consumer/native-profile -m /home/consumer/native2.scm")
+      assert succeed("/home/consumer/native-profile/bin/native-proof").strip() == "native-guix-2"
+      succeed(guix + " package -p /home/consumer/native-profile --roll-back")
+      assert succeed("/home/consumer/native-profile/bin/native-proof").strip() == "native-guix-1"
+      succeed(guix + " package --bootstrap --no-substitutes -p /home/consumer/native-profile -m /home/consumer/empty.scm")
+      machine.succeed("test ! -e /home/consumer/native-profile/bin/native-proof")
+      ${pkgs.lib.optionalString bundled ''
+        machine.succeed("mkdir -p /home/consumer/no-nix; printf '#!${pkgs.runtimeShell}\\necho incompatible-client\\n' > /home/consumer/no-nix/nix-store; chmod 755 /home/consumer/no-nix/nix-store")
+      ''}
       machine.succeed("nix-store --gc; test ! -e ${builtins.unsafeDiscardStringContext (toString app)}")
       succeed(guix + " package --bootstrap --no-substitutes -p /home/consumer/app-profile -m /home/consumer/application.scm")
       implementation = succeed("readlink -f /home/consumer/app-profile/bin/guix-app").strip().rsplit('/bin/', 1)[0]

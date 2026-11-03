@@ -65,3 +65,29 @@ Guix GC removes the owning package, run `guix-impurifier prune` as the owner.
 The VM replaces a real shared library and verifies that the next launch sees
 its new version, then tests removal and pruning. GPU/kernel ABI compatibility
 and automatic cleanup after arbitrary Guix transactions are not claimed.
+
+## Prepared native packages and bundled clients
+
+`makeNativePackage { name; version; payload; license ? null; }` emits a native
+Guix package definition and a complete prepared prefix tree. Its trivial native
+builder copies those files into the Guix output without adding a Nix SDK,
+launcher or activation. The producer supplies files that already work in their
+Guix output prefix; this does not relocate binaries. Optional `license` names a
+Guix license identifier such as `expat`; omitted license metadata is `#f`.
+Guix's own store, daemon, builder and profile semantics still apply.
+
+The VM builds and installs emitted native definitions, executes static payloads,
+changes versions, rolls back and replaces the profile manifest to remove the
+application. An installed executable also runs in an isolated root without
+`/nix`. The manager fixture uses the official Guix bootstrap and NixOS host
+tools; it does not claim a complete Guix System boot without Nix.
+
+Nix-backed constructors accept `bundledNixStore` (a static ELF client) and
+`bundledNixNotices` (upstream notice files). They carry a private client and omit
+the SDK CLI. Launch selects a compatible external client before the bundle,
+before registering immutable roots or capturing hardware; explicit
+`IMPURIFIER_NIX_STORE` disables fallback. Trusted initial preparation uses host
+tools and never executes the Guix-output-owned client as root. Existing Nix
+store/daemon infrastructure and initial SDK preparation remain necessary. The
+bundled VM repeats the profile, rollback, hardware and GC lifecycle with an
+incompatible external candidate.

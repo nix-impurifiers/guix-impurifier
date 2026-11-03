@@ -22,10 +22,20 @@
     {
       formatter = pkgs.nixfmt-tree;
       packages.default = impurifier.package;
-      checks = import ../../../tests {
-        inherit pkgs impurifier;
-        coreSrc = inputs.impurifier;
-        tools = impurifier.tools;
-      };
+      checks =
+        import ../../../tests {
+          inherit pkgs impurifier;
+          coreSrc = inputs.impurifier;
+          tools = impurifier.tools;
+        }
+        // {
+          bundled-vm =
+            (import ../../../tests {
+              inherit pkgs impurifier;
+              coreSrc = inputs.impurifier;
+              tools = impurifier.tools;
+              bundled = true;
+            }).native-vm;
+        };
     };
 }
